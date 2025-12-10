@@ -1,0 +1,180 @@
+
+---
+
+## 2️⃣ `templates/superannotate-sync.yml`
+
+This is the **component template** that lives under `templates/` and is published via the CI/CD Catalog.
+
+```yaml
+spec:
+  inputs:
+    api_key:
+      description: "SuperAnnotate API token used to authenticate against Zimmer API."
+    actions_path:
+      default: "actions"
+      description: "Path to the directory containing custom action folders."
+    base_url:
+      default: "https://zimmer.superannotate.com/api/v1"
+      description: "Base URL of the Zimmer API."
+    job_stage:
+      default: "deploy"
+      description: "Stage in which the SuperAnnotate sync job runs."
+---
+superannotate-sync:
+  stage: $[[ inputs.job_stage ]]
+  image: python:3.11
+  before_script:
+    - pip install pyyaml requests
+  script:
+    - |
+      python - << 'PY'
+      import os
+      import json
+      from urllib.parse import quote
+
+      import requests
+      import yaml
+
+      def sanitize_token(token: str) -> str:
+          return token.replace("\\n", "").replace("\\r", "").strip()
+
+      def load_yaml(path):
+          with open(path, "r", encoding="utf-8") as f:
+              return yaml.safe_load(f)
+
+      def encode_file(path):
+          with open(path, "r", encoding="utf-8") as f:
+              return quote(f.read())
+
+      def find_python_file(folder):
+          files = os.listdir(folder)
+          py_files = [f for f in files if f.endswith(".py")]
+          if len(py_files) != 1:
+              raise Exception(f"Folder '{folder}' must contain exactly one .py file, found {len(py_files)}.")
+          return os.path.join(folder, py_files[0])
+
+      def get_existing_action(base_url, name, headers):
+          url = f"{base_url}/custom_task"
+          params = {"name": name}
+          resp = requests.get(url, params=params, headers=headers)
+          if resp.status_code == 404:
+              return None
+          if resp.status_code >= 400:
+              raise Exception(f"GET custom_task failed (status {resp.status_code}): {resp.text}")
+
+          data = resp.json()
+          # Handle list or single object responses defensively
+          if isinstance(data, list):
+              return data[0] if data else None
+          if isinstance(data, dict) and data.get("id"):
+              return data
+          return None
+
+      def create_action(base_url, payload, headers):
+          url = f"{base_url}/custom_task"
+          resp = requests.post(url, json=payload, headers=headers)
+          if resp.status_code not in (200, 201):
+              raise Exception(f"POST custom_task failed (status {resp.status_code}): {resp.text}")
+          return resp.json()
+
+      def update_action(base_url, action_id, payload, headers):
+          url = f"{base_url}/custom_task/{action_id}"
+          resp = requests.patch(url, json=payload, headers=headers)
+          if resp.status_code >= 400:
+              raise Exception(f"PATCH custom_task/{action_id} failed (status {resp.status_code}): {resp.text}")
+          return resp.json()
+
+      def process_action_folder(base_url, folder, headers):
+          folder_name = os.path.basename(folder)
+          print(f"---")
+          print(f"Processing folder: {folder_name}")
+
+          config_path = os.path.join(folder, "config.yaml")
+          if not os.path.exists(config_path):
+              raise Exception(f"Missing config.yaml in folder '{folder}'")
+
+          config = load_yaml(config_path)
+
+          required_keys = ["memory", "interpreter", "time_limit", "concurrency"]
+          for key in required_keys:
+              if key not in config:
+                  raise Exception(f"config.yaml in '{folder}' is missing required key: {key}")
+
+          py_file_path = find_python_file(folder)
+          encoded_file = encode_file(py_file_path)
+
+          name = config.get("name") or folder_name
+          description = config.get("description", "")
+
+          payload = {
+              "name": name,
+              "description": description,
+              "memory": config["memory"],
+              "time_limit": config["time_limit"],
+              "concurrency": config["concurrency"],
+              "config": {
+                  "interpreter": config["interpreter"],
+                  "requirements": config.get("requirements", []),
+              },
+              "file": encoded_file,
+          }
+
+          print("Payload preview:")
+          print(json.dumps(payload, indent=2))
+
+          existing = get_existing_action(base_url, name, headers)
+
+          if existing is None:
+              print(f"Creating new custom_task: {name}")
+              res = create_action(base_url, payload, headers)
+              print(f"Created custom_task with response: {json.dumps(res, indent=2)}")
+          else:
+              action_id = existing.get("id")
+              print(f"Updating existing custom_task '{name}' (id={action_id})")
+              res = update_action(base_url, action_id, payload, headers)
+              print(f"Updated custom_task with response: {json.dumps(res, indent=2)}")
+
+      def main():
+          token = os.environ.get("PLATFORM_TOKEN")
+          if not token:
+              raise Exception("PLATFORM_TOKEN is not set. Please pass the 'api_key' input and map it to a CI variable.")
+
+          token = sanitize_token(token)
+
+          base_url = os.environ.get("ZIMMER_BASE_URL", "https://zimmer.superannotate.com/api/v1").rstrip("/")
+          actions_dir = os.environ.get("ACTIONS_DIR", "actions")
+
+          headers = {
+              # [Unverified] Header format; adjust if Zimmer API expects a different key.
+              "Authorization": f"Bearer {token}",
+              "Content-Type": "application/json",
+          }
+
+          if not os.path.isdir(actions_dir):
+              print(f"No '{actions_dir}/' directory found. Nothing to sync.")
+              return
+
+          print(f"Using actions directory: {actions_dir}")
+          print(f"Zimmer API base URL: {base_url}")
+
+          any_processed = False
+          for entry in os.listdir(actions_dir):
+              folder_path = os.path.join(actions_dir, entry)
+              if os.path.isdir(folder_path):
+                  any_processed = True
+                  try:
+                      process_action_folder(base_url, folder_path, headers)
+                  except Exception as e:
+                      print(f"Error processing folder '{entry}': {e}")
+                      raise
+
+          if not any_processed:
+              print(f"No subfolders found under '{actions_dir}/'. Nothing to sync.")
+
+      if __name__ == "__main__":
+          main()
+      PY
+  variables:
+    PLATFORM_TOKEN: "$[[ inputs.api_key ]]"
+    ACTIONS_DIR: "$[[ inputs.actions_path ]]"
+    ZIMMER_BASE_URL: "$[[ inputs.base_url ]]"
